@@ -31,10 +31,15 @@ Werner Brückner -- Teletext in digital television
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
-#include <signal.h>
 #include <time.h>
 #include <unistd.h>
 #include <inttypes.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <err.h>
+#include "ts.h"
+#include "rtp.h"
 #include "hamming.h"
 #include "teletext.h"
 
@@ -73,9 +78,6 @@ typedef enum {
     YES = 0x01,
     UNDEF = 0xff
 } bool_t;
-
-// size of a (M2)TS packet in bytes (TS = 188, M2TS = 192)
-#define TS_PACKET_SIZE 192
 
 // size of a TS packet payload in bytes
 #define TS_PACKET_PAYLOAD_SIZE 184
@@ -177,48 +179,21 @@ struct {
     uint8_t verbose; // should telxcc be verbose?
     uint16_t page; // teletext page containing cc we want to filter
     uint16_t tid; // 13-bit packet ID for teletext stream
-    double offset; // time offset in seconds
     uint8_t colours; // output <font...></font> tags
-    uint8_t bom; // print UTF-8 BOM characters at the beginning of output
-    uint8_t nonempty; // produce at least one (dummy) frame
     uint64_t utc_refvalue; // UTC referential value
     // FIXME: move SE_MODE to output module
     uint8_t se_mode;
-    //char *template; // output format template
-    uint8_t m2ts; // consider input stream is af s M2TS, instead of TS
 } config = {
     .input_name = NULL,
     .output_name = NULL,
     .verbose = NO,
     .page = 0,
     .tid = 0,
-    .offset = 0,
-    .colours = NO,
-    .bom = YES,
-    .nonempty = NO,
+    .colours = YES,
     .utc_refvalue = 0,
-    .se_mode = NO,
-    //.template = NULL,
-    .m2ts = NO
+    .se_mode = YES,
 };
 
-/*
-formatting template:
-    %f -- from timestamp (absolute, UTC)
-    %t -- to timestamp (absolute, UTC)
-    %F -- from time (SRT)
-    %T -- to time (SRT)
-    %g -- from timestamp (relative)
-    %u -- to timestamp (relative)
-    %c -- counter 0-based
-    %C -- counter 1-based
-    %s -- subtitles
-    %l -- subtitles (lines)
-    %p -- page number
-    %i -- stream ID
-*/
-
-FILE *fin = NULL;
 FILE *fout = NULL;
 
 // macro -- output only when increased verbosity was turned on
@@ -395,7 +370,6 @@ uint16_t telx_to_ucs2(uint8_t c) {
     return r;
 }
 
-// FIXME: implement output modules (to support different formats, printf formatting etc)
 void process_page(teletext_page_t *page) {
 #ifdef DEBUG
     for (uint8_t row = 1; row < 25; row++) {
@@ -423,7 +397,8 @@ void process_page(teletext_page_t *page) {
 
     if (config.se_mode == YES) {
         ++frames_produced;
-        fprintf(fout, "%.3f|", (double)page->show_timestamp / 1000.0);
+        fprintf(fout, "%" PRIu64"\t%" PRIu64 "\t",
+                page->show_timestamp, page->hide_timestamp);
     }
     else {
         char timecode_show[24] = { 0 };
@@ -533,11 +508,10 @@ void process_page(teletext_page_t *page) {
         }
 
         // line delimiter
-        fprintf(fout, "%s", (config.se_mode == YES) ? " " : "\r\n");
+        fprintf(fout, "%s", (config.se_mode == YES) ? "\t" : "\n");
     }
 
-    fprintf(fout, "\r\n");
-    fflush(fout);
+    fprintf(fout, "\n");
 }
 
 void process_telx_packet(data_unit_t data_unit_id, teletext_packet_payload_t *packet, uint64_t timestamp) {
@@ -841,7 +815,7 @@ void process_pes_packet(uint8_t *buffer, uint16_t size) {
     static int64_t delta = 0;
     static uint32_t t0 = 0;
     if (states.pts_initialized == NO) {
-        delta = 1000 * config.offset + 1000 * config.utc_refvalue - t;
+        delta = 1000 * config.utc_refvalue - t;
         states.pts_initialized = YES;
 
         if ((using_pts == NO) && (global_timestamp == 0)) {
@@ -960,269 +934,62 @@ if (pmt.pointer_field > 0) {
     }
 }
 
-// graceful exit support
-uint8_t exit_request = NO;
-
-void signal_handler(int sig) {
-    if ((sig == SIGINT) || (sig == SIGTERM)) {
-        fprintf(stderr, "- SIGINT/SIGTERM received, preparing graceful exit\n");
-        exit_request = YES;
-    }
-}
-
-char* basename(const char *s) {
-    char *r = (char *)s;
-    while (*s) if (*s++ == '/') r = (char *)s;
-    return r;
-}
-
 // main
 int main(const int argc, char *argv[]) {
     int ret = EXIT_FAILURE;
-    
-    if ((argc > 1) && (strcmp(argv[1], "-V") == 0)) {
-        fprintf(stderr, "%s\n", TELXCC_VERSION);
-        ret = EXIT_SUCCESS;
-        goto fail;
-    }
 
-#ifdef __MINGW32__
-    int argwc = 0;
-    wchar_t **argw = CommandLineToArgvW(GetCommandLineW(), &argwc);
-    if ((argw == NULL) || (argwc != argc)) {
-        fprintf(stderr, "! Could not process Windows UNICODE command line parameters.\n\n");
-        goto fail;
-    }
-#endif
+    uint16_t pid;
+    uint16_t page;
+    in_addr_t addr;
+    uint32_t port;
 
-    fprintf(stderr, "telxcc - TELeteXt Closed Captions decoder\n");
-    fprintf(stderr, "(c) Forers, s. r. o., <info@forers.com>, 2011-2014; Licensed under the GPL.\n");
-    fprintf(stderr, "Version %s (%s), Built on %s\n", TELXCC_VERSION, PLATFORM, __DATE__);
-    fprintf(stderr, "\n");
+    int s;
+    int e;
 
-    // command line params parsing
-    for (uint8_t i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "-h") == 0) {
-            fprintf(stderr, "Usage: %s -h\n", basename(argv[0]));
-            fprintf(stderr, "  or   %s -V\n", basename(argv[0]));
-            fprintf(stderr, "  or   %s [-v] [-m] [-i INPUT] [-o OUTPUT] [-p PAGE] [-t TID] [-f OFFSET] [-n] [-1] [-c] [-s [REF]]\n", basename(argv[0]));
-            fprintf(stderr, "\n");
-            fprintf(stderr, "  -h          this help text\n");
-            fprintf(stderr, "  -V          print out version and quit\n");
-            fprintf(stderr, "  -v          be verbose\n");
-            fprintf(stderr, "  -m          input file format is BDAV MPEG-2 Transport Stream (BluRay and some IP-TV recorders)\n");
-            fprintf(stderr, "  -i INPUT    transport stream (- = STDIN, default STDIN)\n");
-            fprintf(stderr, "  -o OUTPUT   subtitles in SubRip SRT file format (UTF-8 encoded, NFC) (- = STDOUT, default STDOUT)\n");
-            fprintf(stderr, "  -p PAGE     teletext page number carrying closed captions\n");
-            fprintf(stderr, "  -t TID      transport stream PID of teletext data sub-stream\n");
-            fprintf(stderr, "              if the value of 8192 is specified, the first suitable stream will be used\n");
-            fprintf(stderr, "  -f OFFSET   subtitles offset in seconds\n");
-            fprintf(stderr, "  -n          do not print UTF-8 BOM characters to the file\n");
-            fprintf(stderr, "  -1          produce at least one (dummy) frame\n");
-            fprintf(stderr, "  -c          output colour information in font HTML tags\n");
-            //fprintf(stderr, "  -F FORMAT   //FIXME\n");
-            fprintf(stderr, "  -s [REF]    search engine mode; produce absolute timestamps in UTC and output data in one line\n");
-            fprintf(stderr, "              if REF (unix timestamp) is omitted, use current system time,\n");
-            fprintf(stderr, "              telxcc will automatically switch to transport stream UTC timestamps when available\n");
-            fprintf(stderr, "\n");
-            ret = EXIT_SUCCESS;
-            goto fail;
-        }
-        else if ((strcmp(argv[i], "-i") == 0) && (argc > i + 1)) {
-#ifdef __MINGW32__
-            config.input_name = argw[++i];
-#else
-            config.input_name = argv[++i];
-#endif
-        }
-        else if ((strcmp(argv[i], "-o") == 0) && (argc > i + 1)) {
-#ifdef __MINGW32__
-            config.output_name = argw[++i];
-#else
-            config.output_name = argv[++i];
-#endif
-        }
-        else if ((strcmp(argv[i], "-p") == 0) && (argc > i + 1)) {
-            config.page = atoi(argv[++i]);
-        }
-        else if ((strcmp(argv[i], "-t") == 0) && (argc > i + 1)) {
-            config.tid = atoi(argv[++i]);
-        }
-        else if ((strcmp(argv[i], "-f") == 0) && (argc > i + 1)) {
-            config.offset = atof(argv[++i]);
-        }
-        else if (strcmp(argv[i], "-n") == 0) {
-            config.bom = NO;
-        }
-        else if (strcmp(argv[i], "-1") == 0) {
-            config.nonempty = YES;
-        }
-        else if (strcmp(argv[i], "-c") == 0) {
-            config.colours = YES;
-        }
-        //else if ((strcmp(argv[i], "-F") == 0) && (argc > i + 1)) {
-        //  //FIXME
-        //}
-        else if (strcmp(argv[i], "-v") == 0) {
-            config.verbose = YES;
-        }
-        else if (strcmp(argv[i], "-s") == 0) {
-            config.se_mode = YES;
-            uint64_t t = 0;
-            if (argc > i + 1) {
-                t = atoi(argv[i + 1]);
-                if (t > 0) i++;
-            }
-            if (t <= 0) {
-                time_t now = time(NULL);
-                t = time(&now);
-            }
-            config.utc_refvalue = t;
-        }
-        else if (strcmp(argv[i], "-m") == 0) {
-            config.m2ts = YES;
-        }
-        else {
-            fprintf(stderr, "! Unknown option %s\n", argv[i]);
-            fprintf(stderr, "- For usage options run \"%s -h\"\n\n", argv[0]);
-            goto fail;
-        }
-    }
+    if (argc != 5)
+        errx(1, "usage: teletext-ingest <pid> <page> <addr> <port>\n");
 
-// for better UX in Windows we want to detect that the app is not run by "double-clicking" in Windows Explorer GUI
-// raise a dialog box if the application is invoked by "double-click"
-// if argc > 1 do not display warning, because telxcc could be run within scheduler or via shortcut link etc.
-#ifdef __MINGW32__
-    if (argc == 1) {
-        HWND consoleWnd = GetConsoleWindow();
-        DWORD dwProcessId = 0;
-        GetWindowThreadProcessId(consoleWnd, &dwProcessId);
+    pid = strtoul(argv[1], NULL, 10);
+    page = strtoul(argv[2], NULL, 10);
+    addr = inet_addr(argv[3]);
+    port = strtoul(argv[4], NULL, 10);
 
-        if (GetCurrentProcessId() == dwProcessId) {
-            INITCOMMONCONTROLSEX iccx = {
-                .dwSize = sizeof(iccx),
-                .dwICC = ICC_STANDARD_CLASSES
-            };
-            InitCommonControlsEx(&iccx);
-            MessageBox(NULL, "telxcc is a console application. Please run it from command line (cmd.exe), scheduler or another application.", "telxcc", MB_OK | MB_ICONWARNING);
-            goto fail;
-        }
-    }
-#endif
+    config.tid = pid; // DVB teletext PID
+    // dec to BCD, magazine pages numbers are in BCD (ETSI 300 706)
+    config.page = ((page / 100) << 8) | (((page / 10) % 10) << 4) | (page % 10);
 
-    if (config.m2ts == YES) {
-        fprintf(stderr, "- Processing input stream as a BDAV MPEG-2 Transport Stream\n");
-    }
+    config.utc_refvalue = (uint64_t) time(NULL);
 
-    if (config.se_mode == YES) {
-        time_t t0 = (time_t)config.utc_refvalue;
-        fprintf(stderr, "- Search engine mode active, UTC referential value = %s", ctime(&t0));
-    }
+    fout = stdout;
 
-    // teletext page number out of range
-    if ((config.page != 0) && ((config.page < 100) || (config.page > 899))) {
-        fprintf(stderr, "! Teletext page number could not be lower than 100 or higher than 899\n\n");
-        goto fail;
-    }
+    // Multicast receiver
+    s = socket(AF_INET, SOCK_DGRAM, PF_UNSPEC);
+    if (s == -1)
+        err(1, "socket");
 
-    // default teletext page
-    if (config.page > 0) {
-        // dec to BCD, magazine pages numbers are in BCD (ETSI 300 706)
-        config.page = ((config.page / 100) << 8) | (((config.page / 10) % 10) << 4) | (config.page % 10);
-    }
+    struct sockaddr_in sin = (struct sockaddr_in) {0};
+    sin.sin_family = AF_INET;
+    sin.sin_addr.s_addr = htonl(INADDR_ANY);
+    sin.sin_port = htons(port);
 
-    // PID out of range
-    if (config.tid > 0x2000) {
-        fprintf(stderr, "! Transport stream PID could not be higher than 8192\n\n");
-        goto fail;
-    }
+    e = bind(s, (struct sockaddr *) &sin, sizeof sin);
+    if (e == -1)
+        err(1, "bind");
 
-    signal(SIGINT, signal_handler);
-    signal(SIGTERM, signal_handler);
+    e = setsockopt(s, IPPROTO_IP, IP_ADD_MEMBERSHIP,
+            (struct ip_mreq[]){{.imr_multiaddr.s_addr = addr, .imr_interface.s_addr = htonl(INADDR_ANY)}},
+            sizeof(struct ip_mreq));
 
-#ifdef __MINGW32__
-    if ((config.input_name == NULL) || (wcscmp(config.input_name, L"-") == 0)) {
-        fin = stdin;
-    } else {
-        if ((fin = _wfopen(config.input_name, L"rb")) == NULL) {
-            fprintf(stderr, "! Could not open input file.\n\n");
-            goto fail;
-        }
-    }
-#else
-    if ((config.input_name == NULL) || (strcmp(config.input_name, "-") == 0)) {
-        fin = stdin;
-    } else {
-        if ((fin = fopen(config.input_name, "rb")) == NULL) {
-            fprintf(stderr, "! Could not open input file \"%s\".\n\n", config.input_name);
-            goto fail;
-        }
-    }
-#endif
-
-    if (isatty(fileno(fin))) {
-        fprintf(stderr, "! STDIN is a terminal. STDIN must be redirected.\n\n");
-        goto fail;
-    }
-
-#ifdef __MINGW32__
-    if ((config.output_name == NULL) || (wcscmp(config.output_name, L"-") == 0)) {
-        fout = stdout;
-    } else {
-        if ((fout = _wfopen(config.output_name, L"wb")) == NULL) {
-            fprintf(stderr, "! Could not open output file.\n\n");
-            goto fail;
-        }
-    }
-#else
-    if ((config.output_name == NULL) || (strcmp(config.output_name, "-") == 0)) {
-        fout = stdout;
-    } else {
-        if ((fout = fopen(config.output_name, "wb")) == NULL) {
-            fprintf(stderr, "! Could not open output file \"%s\".\n\n", config.output_name);
-            goto fail;
-        }
-    }
-#endif
-
-#ifdef __MINGW32__
-    if (isatty(fileno(fout))) {
-        fprintf(stderr, "! On Windows platform produced closed captions do not have the same encoding as the command line terminal (UTF-8 vs UCS-2). Hence CC could not be printed directly to the terminal.\n\n");
-        goto fail;
-    }
-#endif
-
-    if (isatty(fileno(fout))) {
-        fprintf(stderr, "- STDOUT is a terminal, omitting UTF-8 BOM sequence on the output.\n");
-        config.bom = NO;
-    }
-
-    // full buffering -- disables flushing after CR/FL, we will flush manually whole SRT frames
-    setvbuf(fout, (char*)NULL, _IOFBF, 0);
-    
-    // print UTF-8 BOM chars
-    if (config.bom == YES) {
-        fprintf(fout, "\xef\xbb\xbf");
-        fflush(fout);
-    }
+    if (e == -1)
+        err(1, "setsockopt");
 
     // PROCESING
 
-    // FYI, packet counter
-    uint32_t packet_counter = 0;
-
     // TS packet buffer
-    uint8_t ts_packet_buffer[TS_PACKET_SIZE] = { 0 };
-    uint8_t ts_packet_size = TS_PACKET_SIZE - 4;
+    uint8_t packet_buffer[RTP_HEADER_SIZE + TS_SIZE] = { 0 };
+    uint8_t packet_size = RTP_HEADER_SIZE + TS_SIZE;
 
-    // pointer to TS packet buffer start
-    uint8_t *ts_packet = &ts_packet_buffer[0];
-
-    // if telxcc is configured to be in M2TS mode, it reads larger packets and ignores first 4 bytes
-    if (config.m2ts == YES) {
-        ts_packet_size = TS_PACKET_SIZE;
-        ts_packet = &ts_packet_buffer[4];
-    }
+    uint8_t *ts_packet;
 
     // 0xff means not set yet
     uint8_t continuity_counter = 255;
@@ -1232,19 +999,16 @@ int main(const int argc, char *argv[]) {
     uint16_t payload_counter = 0;
 
     // reading input
-    while ((exit_request == NO) && (fread(&ts_packet_buffer, 1, ts_packet_size, fin) == ts_packet_size)) {
-        // not TS packet -- misaligned?
-        if (ts_packet[0] != 0x47) {
-            fprintf(stderr, "! Invalid TS packet header; TS seems to be misaligned\n");
+    while (1) {
+        if (recv(s, &packet_buffer, packet_size, 0) != packet_size || !rtp_check_hdr(&packet_buffer[0])) {
+            VERBOSE_ONLY fprintf(stderr, "Invalid RTP packet received. Skipping\n"); // WARN
+            continue;
+        }
 
-            uint16_t shift = 0;
-            for (shift = 1; shift < TS_PACKET_SIZE; shift++) if (ts_packet[shift] == 0x47) break;
-
-            if (shift < TS_PACKET_SIZE) {
-                VERBOSE_ONLY fprintf(stderr, "! TS-packet-header-like byte found shifted by %"PRIu16" bytes, aligning TS stream (at least one TS packet lost)\n", shift);
-                for (uint16_t i = shift; i < TS_PACKET_SIZE; i++) ts_packet[i - shift] = ts_packet[i];
-                fread(&ts_packet[TS_PACKET_SIZE - shift], 1, shift, fin);
-            }
+        ts_packet = rtp_payload(&packet_buffer[0]);
+        if (!ts_validate(ts_packet)) {
+            VERBOSE_ONLY fprintf(stderr, "Invalid TS packet received. Skipping\n"); // WARN
+            continue;
         }
 
         // Transport Stream Header
@@ -1291,42 +1055,14 @@ int main(const int argc, char *argv[]) {
         }
 
         // null packet
-        if (header.pid == 0x1fff) continue;
-
-        // TID not specified, autodetect via PAT/PMT
-        if (config.tid == 0) {
-            // process PAT
-            if (header.pid == 0x0000) {
-                analyze_pat(&ts_packet[4], TS_PACKET_PAYLOAD_SIZE);
-                continue;
-            }
-
-            // process PMT
-            if (in_array(pmt_map, pmt_map_count, header.pid) == YES) {
-                analyze_pmt(&ts_packet[4], TS_PACKET_PAYLOAD_SIZE);
-                continue;
-            }
-        }
-
-        // TID 0x2000 specified => dummy autodetection
-        if (config.tid == 0x2000) {
-            if (header.payload_unit_start > 0) {
-                // searching for PES header and "Private Stream 1" stream_id
-                uint64_t pes_prefix = (ts_packet[4] << 16) | (ts_packet[5] << 8) | ts_packet[6];
-                uint8_t pes_stream_id = ts_packet[7];
-
-                if ((pes_prefix == 0x000001) && (pes_stream_id == 0xbd)) {
-                    config.tid = header.pid;
-                    fprintf(stderr, "- No teletext PID specified, first received suitable stream PID is %"PRIu16" (0x%x), not guaranteed\n", config.tid, config.tid);
-                    continue;
-                }
-            }
-        }
+        if (header.pid == 0x1fff)
+            continue;
 
         if (config.tid == header.pid) {
             // TS continuity check
-            if (continuity_counter == 255) continuity_counter = header.continuity_counter;
-            else {
+            if (continuity_counter == 255) {
+                continuity_counter = header.continuity_counter;
+            } else {
                 if (af_discontinuity == 0) {
                     continuity_counter = (continuity_counter + 1) % 16;
                     if (header.continuity_counter != continuity_counter) {
@@ -1339,78 +1075,27 @@ int main(const int argc, char *argv[]) {
             }
 
             // waiting for first payload_unit_start indicator
-            if ((header.payload_unit_start == 0) && (payload_counter == 0)) continue;
+            if ((header.payload_unit_start == 0) && (payload_counter == 0))
+                continue;
 
             // proceed with payload buffer
-            if ((header.payload_unit_start > 0) && (payload_counter > 0)) process_pes_packet(payload_buffer, payload_counter);
+            if ((header.payload_unit_start > 0) && (payload_counter > 0))
+                process_pes_packet(payload_buffer, payload_counter);
 
             // new payload frame start
-            if (header.payload_unit_start > 0) payload_counter = 0;
+            if (header.payload_unit_start > 0)
+                payload_counter = 0;
 
             // add payload data to buffer
             if (payload_counter < (PAYLOAD_BUFFER_SIZE - TS_PACKET_PAYLOAD_SIZE)) {
                 memcpy(&payload_buffer[payload_counter], &ts_packet[4], TS_PACKET_PAYLOAD_SIZE);
                 payload_counter += TS_PACKET_PAYLOAD_SIZE;
-                packet_counter++;
             }
             else VERBOSE_ONLY fprintf(stderr, "! Packet payload size exceeds payload_buffer size, probably not teletext stream\n");
         }
     }
 
-    // output any pending close caption
-    if (page_buffer.tainted == YES) {
-        // this time we do not subtract any frames, there will be no more frames
-        page_buffer.hide_timestamp = last_timestamp;
-        process_page(&page_buffer);
-    }
-
-    VERBOSE_ONLY {
-        if (config.tid == 0) fprintf(stderr, "- No teletext PID specified, no suitable PID found in PAT/PMT tables. Please specify teletext PID via -t parameter.\n  You can also specify -t 8192 for another type of autodetection (choosing the first suitable stream)\n");
-        if (frames_produced == 0) fprintf(stderr, "- No frames produced. CC teletext page number was probably wrong.\n");
-        fprintf(stderr, "- There were some CC data carried via pages = ");
-        // We ignore i = 0xff, because 0xffs are teletext ending frames
-        for (uint16_t i = 0; i < 255; i++) {
-            for (uint8_t j = 0; j < 8; j++) {
-                uint8_t v = cc_map[i] & (1 << j);
-                if (v > 0) fprintf(stderr, "%03x ", ((j + 1) << 8) | i);
-            }
-        }
-        fprintf(stderr, "\n");
-    }
-
-    if ((config.se_mode == NO) && (frames_produced == 0) && (config.nonempty == YES)) {
-        fprintf(fout, "1\r\n00:00:00,000 --> 00:00:10,000\r\n.\r\n\r\n");
-        fflush(fout);
-        frames_produced++;
-    }
-
-    fprintf(stderr, "- Done (%"PRIu32" teletext packets processed, %"PRIu32" frames produced)\n", packet_counter, frames_produced);
-    fprintf(stderr, "\n");
-
     ret = EXIT_SUCCESS;
-
-fail:
-
-    if ((fin != NULL) && (fin != stdin)) {
-        fclose(fin);
-        fin = NULL;
-    }
-
-    if ((fout != NULL) && (fout != stdout)) {
-        fclose(fout);
-        fout = NULL;
-    }
-
-#ifdef __MINGW32__
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wmaybe-uninitialized"
-    if (argw != NULL) {
-        LocalFree(argw);
-        argw = NULL;
-        argwc = 0;
-    }
-#pragma GCC diagnostic pop
-#endif
 
     return ret;
 }
