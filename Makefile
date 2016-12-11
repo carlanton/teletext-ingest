@@ -4,8 +4,8 @@ LD ?= ld
 LDFLAGS +=
 DEST := /usr/local
 
-OBJS = telxcc.o
-EXEC = telxcc
+OBJS = telxcc.o teletext-ingest.o
+EXEC = teletext-ingest
 
 all : $(EXEC)
 
