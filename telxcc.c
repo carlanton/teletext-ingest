@@ -33,17 +33,21 @@ Werner Brückner -- Teletext in digital television
 #include <stdlib.h>
 #include <time.h>
 #include <sys/socket.h>
-#include "ts.h"
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <math.h>
+#include <err.h>
 #include "rtp.h"
+#include "ts.h"
 #include "hamming.h"
 #include "teletext.h"
 #include "telxcc.h"
 
 // size of a TS packet payload in bytes
-#define TS_PACKET_PAYLOAD_SIZE 184
+const uint8_t TS_PACKET_PAYLOAD_SIZE = (TS_SIZE - TS_HEADER_SIZE);
 
 // size of a packet payload buffer
-#define PAYLOAD_BUFFER_SIZE 4096
+const uint16_t PAYLOAD_BUFFER_SIZE = 4096;
 
 const char* TTXT_COLOURS[8] = {
     //black,     red,       green,     yellow,    blue,      magenta,   cyan,      white
@@ -54,11 +58,13 @@ const char* TTXT_COLOURS[8] = {
 struct {
     uint8_t verbose; // should telxcc be verbose?
     uint16_t page; // teletext page containing cc we want to filter
+    uint16_t tid;
     uint64_t utc_refvalue; // UTC referential value
     void (*printer)(frame_t*);
 } config = {
-    .verbose = YES,
+    .verbose = NO,
     .page = 0,
+    .tid = 0,
     .utc_refvalue = 0,
     .printer = NULL
 };
@@ -113,6 +119,13 @@ struct {
     { .character = '>', .entity = "&gt;" },
     { .character = '&', .entity = "&amp;" }
 };
+
+// 0xff means not set yet
+uint8_t continuity_counter = 255;
+
+// PES packet buffer
+uint8_t payload_buffer[PAYLOAD_BUFFER_SIZE] = { 0 };
+uint16_t payload_counter = 0;
 
 // helper, array length function
 #define ARRAY_LENGTH(a) (sizeof(a)/sizeof(a[0]))
@@ -204,7 +217,6 @@ static uint16_t telx_to_ucs2(uint8_t c) {
 }
 
 static void process_page(teletext_page_t *page) {
-    printf("ziing\n");
     // optimization: slicing column by column -- higher probability we could find boxed area start mark sooner
     uint8_t page_is_empty = YES;
     for (uint8_t col = 0; col < 40; col++) {
@@ -220,13 +232,7 @@ static void process_page(teletext_page_t *page) {
 
     if (page->show_timestamp > page->hide_timestamp) page->hide_timestamp = page->show_timestamp;
 
-    char text[2048] = {0};
-    char *tp = text;
-    frame_t frame = {
-        .show_timestamp = page->show_timestamp,
-        .hide_timestamp = page->hide_timestamp,
-        .text = text
-    };
+    printf("%"PRIu64"\t%"PRIu64"\t", page->show_timestamp, page->hide_timestamp);
 
     // process data
     for (uint8_t row = 1; row < 25; row++) {
@@ -270,7 +276,7 @@ static void process_page(teletext_page_t *page) {
 
             if (col == col_start) {
                 if (foreground_color != 0x7) {
-                    tp += sprintf(tp, "<font color=\"%s\">", TTXT_COLOURS[foreground_color]);
+                    printf("<font color=\"%s\">", TTXT_COLOURS[foreground_color]);
 
                     font_tag_opened = YES;
                 }
@@ -281,14 +287,14 @@ static void process_page(teletext_page_t *page) {
                     // ETS 300 706, chapter 12.2: Unless operating in "Hold Mosaics" mode,
                     // each character space occupied by a spacing attribute is displayed as a SPACE.
                     if (font_tag_opened == YES) {
-                        tp += sprintf(tp, "</font> ");
+                        printf("</font> ");
                         font_tag_opened = NO;
                     }
 
                     // black is considered as white for telxcc purpose
                     // telxcc writes <font/> tags only when needed
                     if ((v > 0x0) && (v < 0x7)) {
-                        tp += sprintf(tp, "<font color=\"%s\">", TTXT_COLOURS[v]);
+                        printf("<font color=\"%s\">", TTXT_COLOURS[v]);
                         font_tag_opened = YES;
                     }
                 }
@@ -297,7 +303,7 @@ static void process_page(teletext_page_t *page) {
                     // translate some chars into entities, if in colour mode
                     for (uint8_t i = 0; i < ARRAY_LENGTH(ENTITIES); i++) {
                         if (v == ENTITIES[i].character) {
-                            tp += sprintf(tp, "%s", ENTITIES[i].entity);
+                            printf("%s", ENTITIES[i].entity);
                             // v < 0x20 won't be printed in next block
                             v = 0;
                             break;
@@ -308,22 +314,23 @@ static void process_page(teletext_page_t *page) {
                 if (v >= 0x20) {
                     char u[4] = { 0, 0, 0, 0 };
                     ucs2_to_utf8(u, v);
-                    tp += sprintf(tp, "%s", u);
+                    printf("%s", u);
                 }
             }
         }
 
         // no tag will left opened!
         if (font_tag_opened == YES) {
-            tp += sprintf(tp, "</font>");
+            printf("</font>");
             font_tag_opened = NO;
         }
 
         // line delimiter
-        tp += sprintf(tp, "\t");
+        printf("\t");
     }
 
-    config.printer(&frame);
+    printf("\n");
+    fflush(stdout);
 }
 
 static void process_telx_packet(data_unit_t data_unit_id, teletext_packet_payload_t *packet, uint64_t timestamp) {
@@ -544,13 +551,17 @@ static void process_telx_packet(data_unit_t data_unit_id, teletext_packet_payloa
                 t -= 40271;
                 // 4th step: conversion to time_t
                 time_t t0 = (time_t)t;
-                // ctime output itself is \n-ended
+
+                // Silly SVT timezone offset
+                time_t now = time(NULL);
+                time_t diff = (time_t) lroundf( (t0 - now) / 3600.0 ) * 3600;
+                t0 -= diff;
                 fprintf(stderr, "- Programme Timestamp (UTC) = %s", ctime(&t0));
 
                 VERBOSE_ONLY fprintf(stderr, "- Transmission mode = %s\n", (transmission_mode == TRANSMISSION_MODE_SERIAL ? "serial" : "parallel"));
 
                 fprintf(stderr, "- Broadcast Service Data Packet received, resetting UTC referential value to %s", ctime(&t0));
-                config.utc_refvalue = t;
+                config.utc_refvalue = (uint32_t) t0;
                 states.pts_initialized = NO;
 
                 states.programme_info_processed = YES;
@@ -659,122 +670,166 @@ static void process_pes_packet(uint8_t *buffer, uint16_t size) {
     }
 }
 
-void telxcc(int s, uint16_t pid, uint16_t page, void (*printer)(frame_t*)) {
-    fprintf(stderr, "pid: %d, page: %d\n", pid, page);
+void process_ts_packet(uint8_t *ts_packet) {
+    if (!ts_validate(ts_packet)) {
+        VERBOSE_ONLY fprintf(stderr, "Invalid TS packet received. Skipping\n"); // WARN
+        return;
+    }
+
+    // Transport Stream Header
+    // We do not use buffer to struct loading (e.g. ts_packet_t *header = (ts_packet_t *)ts_packet;)
+    // -- struct packing is platform dependant and not performing well.
+    ts_packet_t header = { 0 };
+    header.sync = ts_packet[0];
+    header.transport_error = (ts_packet[1] & 0x80) >> 7;
+    header.payload_unit_start = (ts_packet[1] & 0x40) >> 6;
+    header.transport_priority = (ts_packet[1] & 0x20) >> 5;
+    header.pid = ((ts_packet[1] & 0x1f) << 8) | ts_packet[2];
+    header.scrambling_control = (ts_packet[3] & 0xc0) >> 6;
+    header.adaptation_field_exists = (ts_packet[3] & 0x20) >> 5;
+    header.continuity_counter = ts_packet[3] & 0x0f;
+    //uint8_t ts_payload_exists = (ts_packet[3] & 0x10) >> 4;
+
+    uint8_t af_discontinuity = 0;
+    if (header.adaptation_field_exists > 0) {
+        af_discontinuity = (ts_packet[5] & 0x80) >> 7;
+    }
+
+    // uncorrectable error?
+    if (header.transport_error > 0) {
+        VERBOSE_ONLY fprintf(stderr, "! Uncorrectable TS packet error (received CC %1x)\n", header.continuity_counter);
+        return;
+    }
+
+    // if available, calculate current PCR
+    if (header.adaptation_field_exists > 0) {
+        // PCR in adaptation field
+        uint8_t af_pcr_exists = (ts_packet[5] & 0x10) >> 4;
+        if (af_pcr_exists > 0) {
+            uint64_t pts = ts_packet[6];
+            pts <<= 25;
+            pts |= (ts_packet[7] << 17);
+            pts |= (ts_packet[8] << 9);
+            pts |= (ts_packet[9] << 1);
+            pts |= (ts_packet[10] >> 7);
+            global_timestamp = pts / 90;
+            pts = ((ts_packet[10] & 0x01) << 8);
+            pts |= ts_packet[11];
+            global_timestamp += pts / 27000;
+        }
+    }
+
+    // null packet
+    if (header.pid == 0x1fff)
+        return;
+
+    if (config.tid == header.pid) {
+        // TS continuity check
+        if (continuity_counter == 255) {
+            continuity_counter = header.continuity_counter;
+        } else {
+            if (af_discontinuity == 0) {
+                continuity_counter = (continuity_counter + 1) % 16;
+                if (header.continuity_counter != continuity_counter) {
+                    VERBOSE_ONLY fprintf(stderr, "- Missing TS packet, flushing pes_buffer (expected CC %1x, received CC %1x, TS discontinuity %s, TS priority %s)\n",
+                        continuity_counter, header.continuity_counter, (af_discontinuity ? "YES" : "NO"), (header.transport_priority ? "YES" : "NO"));
+                    payload_counter = 0;
+                    continuity_counter = 255;
+                }
+            }
+        }
+
+        // waiting for first payload_unit_start indicator
+        if ((header.payload_unit_start == 0) && (payload_counter == 0))
+            return;
+
+        // proceed with payload buffer
+        if ((header.payload_unit_start > 0) && (payload_counter > 0))
+            process_pes_packet(payload_buffer, payload_counter);
+
+        // new payload frame start
+        if (header.payload_unit_start > 0)
+            payload_counter = 0;
+
+        // add payload data to buffer
+        if (payload_counter < (PAYLOAD_BUFFER_SIZE - TS_PACKET_PAYLOAD_SIZE)) {
+            memcpy(&payload_buffer[payload_counter], &ts_packet[4], TS_PACKET_PAYLOAD_SIZE);
+            payload_counter += TS_PACKET_PAYLOAD_SIZE;
+        }
+        else VERBOSE_ONLY fprintf(stderr, "! Packet payload size exceeds payload_buffer size, probably not teletext stream\n");
+    }
+}
+
+void telxcc_init(uint16_t pid, uint16_t page) {
+}
+
+
+int main(const int argc, char *argv[]) {
+    uint16_t pid, page;
+    in_addr_t addr;
+    uint32_t port;
+    int s, e;
+
+    if (argc != 5)
+        errx(1, "usage: teletext-ingest <pid> <page> <addr> <port>");
+
+    pid = strtoul(argv[1], NULL, 10);
+    page = strtoul(argv[2], NULL, 10);
+    addr = inet_addr(argv[3]);
+    port = strtoul(argv[4], NULL, 10);
+
+    // Setup telxcc parser config
+    config.utc_refvalue = (uint64_t) time(NULL);
+    config.tid = pid;
     // dec to BCD, magazine pages numbers are in BCD (ETSI 300 706)
     config.page = ((page / 100) << 8) | (((page / 10) % 10) << 4) | (page % 10);
-    config.utc_refvalue = (uint64_t) time(NULL);
-    config.printer = printer;
 
-    // PROCESING
+    // Multicast receiver
+    s = socket(AF_INET, SOCK_DGRAM, PF_UNSPEC);
+    if (s == -1)
+        err(1, "socket");
 
-    // TS packet buffer
-    uint8_t packet_buffer[RTP_HEADER_SIZE + TS_SIZE] = { 0 };
-    uint8_t packet_size = RTP_HEADER_SIZE + TS_SIZE;
+    int yes = 1;
+    e = setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+    if (e == -1)
+        err(1, "reuseaddr");
 
-    uint8_t *ts_packet;
+    struct sockaddr_in sin = { 0 };
+    sin.sin_family = AF_INET;
+    sin.sin_addr.s_addr = htonl(INADDR_ANY);
+    sin.sin_port = htons(port);
 
-    // 0xff means not set yet
-    uint8_t continuity_counter = 255;
+    e = bind(s, (struct sockaddr *) &sin, sizeof sin);
+    if (e == -1)
+        err(1, "bind");
 
-    // PES packet buffer
-    uint8_t payload_buffer[PAYLOAD_BUFFER_SIZE] = { 0 };
-    uint16_t payload_counter = 0;
+    e = setsockopt(s, IPPROTO_IP, IP_ADD_MEMBERSHIP, (struct ip_mreq[]){{
+            .imr_multiaddr.s_addr = addr,
+            .imr_interface.s_addr = htonl(INADDR_ANY)
+        }}, sizeof(struct ip_mreq));
+    if (e == -1)
+        err(1, "setsockopt");
+
+    uint8_t buffer[RTP_HEADER_SIZE + 7 * TS_SIZE] = { 0 };
+    uint8_t *ts_packet = NULL;
 
     // reading input
     while (1) {
-        if (recv(s, &packet_buffer, packet_size, 0) != packet_size || !rtp_check_hdr(&packet_buffer[0])) {
+        if (recv(s, &buffer, sizeof buffer, 0) != sizeof buffer) {
+            VERBOSE_ONLY fprintf(stderr, "Read to few packets :-(\n"); // WARN
+            continue;
+        } else if (!rtp_check_hdr(&buffer[0])) {
             VERBOSE_ONLY fprintf(stderr, "Invalid RTP packet received. Skipping\n"); // WARN
             continue;
         }
 
-        ts_packet = rtp_payload(&packet_buffer[0]);
-        if (!ts_validate(ts_packet)) {
-            VERBOSE_ONLY fprintf(stderr, "Invalid TS packet received. Skipping\n"); // WARN
-            continue;
-        }
+        ts_packet = rtp_payload(&buffer[0]);
 
-        // Transport Stream Header
-        // We do not use buffer to struct loading (e.g. ts_packet_t *header = (ts_packet_t *)ts_packet;)
-        // -- struct packing is platform dependant and not performing well.
-        ts_packet_t header = { 0 };
-        header.sync = ts_packet[0];
-        header.transport_error = (ts_packet[1] & 0x80) >> 7;
-        header.payload_unit_start = (ts_packet[1] & 0x40) >> 6;
-        header.transport_priority = (ts_packet[1] & 0x20) >> 5;
-        header.pid = ((ts_packet[1] & 0x1f) << 8) | ts_packet[2];
-        header.scrambling_control = (ts_packet[3] & 0xc0) >> 6;
-        header.adaptation_field_exists = (ts_packet[3] & 0x20) >> 5;
-        header.continuity_counter = ts_packet[3] & 0x0f;
-        //uint8_t ts_payload_exists = (ts_packet[3] & 0x10) >> 4;
-
-        uint8_t af_discontinuity = 0;
-        if (header.adaptation_field_exists > 0) {
-            af_discontinuity = (ts_packet[5] & 0x80) >> 7;
-        }
-
-        // uncorrectable error?
-        if (header.transport_error > 0) {
-            VERBOSE_ONLY fprintf(stderr, "! Uncorrectable TS packet error (received CC %1x)\n", header.continuity_counter);
-            continue;
-        }
-
-        // if available, calculate current PCR
-        if (header.adaptation_field_exists > 0) {
-            // PCR in adaptation field
-            uint8_t af_pcr_exists = (ts_packet[5] & 0x10) >> 4;
-            if (af_pcr_exists > 0) {
-                uint64_t pts = ts_packet[6];
-                pts <<= 25;
-                pts |= (ts_packet[7] << 17);
-                pts |= (ts_packet[8] << 9);
-                pts |= (ts_packet[9] << 1);
-                pts |= (ts_packet[10] >> 7);
-                global_timestamp = pts / 90;
-                pts = ((ts_packet[10] & 0x01) << 8);
-                pts |= ts_packet[11];
-                global_timestamp += pts / 27000;
-            }
-        }
-
-        // null packet
-        if (header.pid == 0x1fff)
-            continue;
-
-        if (pid == header.pid) {
-            // TS continuity check
-            if (continuity_counter == 255) {
-                continuity_counter = header.continuity_counter;
-            } else {
-                if (af_discontinuity == 0) {
-                    continuity_counter = (continuity_counter + 1) % 16;
-                    if (header.continuity_counter != continuity_counter) {
-                        VERBOSE_ONLY fprintf(stderr, "- Missing TS packet, flushing pes_buffer (expected CC %1x, received CC %1x, TS discontinuity %s, TS priority %s)\n",
-                            continuity_counter, header.continuity_counter, (af_discontinuity ? "YES" : "NO"), (header.transport_priority ? "YES" : "NO"));
-                        payload_counter = 0;
-                        continuity_counter = 255;
-                    }
-                }
-            }
-
-            // waiting for first payload_unit_start indicator
-            if ((header.payload_unit_start == 0) && (payload_counter == 0))
-                continue;
-
-            // proceed with payload buffer
-            if ((header.payload_unit_start > 0) && (payload_counter > 0))
-                process_pes_packet(payload_buffer, payload_counter);
-
-            // new payload frame start
-            if (header.payload_unit_start > 0)
-                payload_counter = 0;
-
-            // add payload data to buffer
-            if (payload_counter < (PAYLOAD_BUFFER_SIZE - TS_PACKET_PAYLOAD_SIZE)) {
-                memcpy(&payload_buffer[payload_counter], &ts_packet[4], TS_PACKET_PAYLOAD_SIZE);
-                payload_counter += TS_PACKET_PAYLOAD_SIZE;
-            }
-            else VERBOSE_ONLY fprintf(stderr, "! Packet payload size exceeds payload_buffer size, probably not teletext stream\n");
+        for (int i = 0; i < 7; i++) {
+            process_ts_packet(ts_packet);
+            ts_packet += TS_SIZE;
         }
     }
+
+    return 0;
 }

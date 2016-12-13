@@ -84,6 +84,4 @@ typedef struct {
     char *text;
 } frame_t;
 
-void telxcc(int s, uint16_t pid, uint16_t page, void (*printer)(frame_t*));
-
 #endif

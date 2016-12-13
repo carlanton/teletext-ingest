@@ -4,7 +4,7 @@ LD ?= ld
 LDFLAGS +=
 DEST := /usr/local
 
-OBJS = telxcc.o teletext-ingest.o
+OBJS = telxcc.o
 EXEC = teletext-ingest
 
 all : $(EXEC)
@@ -19,10 +19,10 @@ clean :
 	-rm -f $(OBJS) $(EXEC) *.1.gz
 
 $(EXEC) : $(OBJS)
-	$(CC) $(LDFLAGS) -o $@ $(OBJS)
+	$(CC) $(LDFLAGS) -o $@ $(OBJS) -lm
 
 %.o : %.c
-	$(CC) -c $(CCFLAGS) -o $@ $<
+	$(CC) -c $(CCFLAGS) -o $@ -lm $<
 
 %.1.gz : %.1
 	gzip -c -9 $< > $@
