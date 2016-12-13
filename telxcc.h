@@ -78,10 +78,7 @@ typedef struct {
     uint8_t tainted; // 1 = text variable contains any data
 } teletext_page_t;
 
-typedef struct {
-    uint64_t show_timestamp; // show at timestamp (in ms)
-    uint64_t hide_timestamp; // hide at timestamp (in ms)
-    char *text;
-} frame_t;
+#define log_warn(...) do { fprintf(stderr, "[WARN] "); fprintf(stderr, __VA_ARGS__); fprintf(stderr, "\n"); } while (0)
+#define log_info(...) do { fprintf(stderr, "[INFO] "); fprintf(stderr, __VA_ARGS__); fprintf(stderr, "\n"); } while (0)
 
 #endif

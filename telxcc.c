@@ -44,33 +44,26 @@ Werner Brückner -- Teletext in digital television
 #include "telxcc.h"
 
 // size of a TS packet payload in bytes
-const uint8_t TS_PACKET_PAYLOAD_SIZE = (TS_SIZE - TS_HEADER_SIZE);
+const uint8_t TS_PACKET_PAYLOAD_SIZE = TS_SIZE - TS_HEADER_SIZE;
 
 // size of a packet payload buffer
-const uint16_t PAYLOAD_BUFFER_SIZE = 4096;
+#define PAYLOAD_BUFFER_SIZE 4096
 
-const char* TTXT_COLOURS[8] = {
+const char *TTXT_COLOURS[8] = {
     //black,     red,       green,     yellow,    blue,      magenta,   cyan,      white
     "#000000", "#ff0000", "#00ff00", "#ffff00", "#0000ff", "#ff00ff", "#00ffff", "#ffffff"
 };
 
 // application config global variable
 struct {
-    uint8_t verbose; // should telxcc be verbose?
     uint16_t page; // teletext page containing cc we want to filter
     uint16_t tid;
     uint64_t utc_refvalue; // UTC referential value
-    void (*printer)(frame_t*);
 } config = {
-    .verbose = NO,
     .page = 0,
     .tid = 0,
     .utc_refvalue = 0,
-    .printer = NULL
 };
-
-// macro -- output only when increased verbosity was turned on
-#define VERBOSE_ONLY if (config.verbose == YES)
 
 // application states -- flags for notices that should be printed only once
 struct {
@@ -141,7 +134,7 @@ static uint8_t unham_8_4(uint8_t a) {
     uint8_t r = UNHAM_8_4[a];
     if (r == 0xff) {
         r = 0;
-        VERBOSE_ONLY fprintf(stderr, "! Unrecoverable data error; UNHAM8/4(%02x)\n", a);
+        log_warn("Unrecoverable data error; UNHAM8/4(%02x)", a);
     }
     return (r & 0x0f);
 }
@@ -172,11 +165,12 @@ static void remap_g0_charset(uint8_t c) {
     if (c != primary_charset.current) {
         uint8_t m = G0_LATIN_NATIONAL_SUBSETS_MAP[c];
         if (m == 0xff) {
-            fprintf(stderr, "- G0 Latin National Subset ID 0x%1x.%1x is not implemented\n", (c >> 3), (c & 0x7));
-        }
-        else {
-            for (uint8_t j = 0; j < 13; j++) G0[LATIN][G0_LATIN_NATIONAL_SUBSETS_POSITIONS[j]] = G0_LATIN_NATIONAL_SUBSETS[m].characters[j];
-            VERBOSE_ONLY fprintf(stderr, "- Using G0 Latin National Subset ID 0x%1x.%1x (%s)\n", (c >> 3), (c & 0x7), G0_LATIN_NATIONAL_SUBSETS[m].language);
+            log_info("G0 Latin National Subset ID 0x%1x.%1x is not implemented", (c >> 3), (c & 0x7));
+        } else {
+            for (uint8_t j = 0; j < 13; j++)
+                G0[LATIN][G0_LATIN_NATIONAL_SUBSETS_POSITIONS[j]] = G0_LATIN_NATIONAL_SUBSETS[m].characters[j];
+
+            log_info("Using G0 Latin National Subset ID 0x%1x.%1x (%s)\n", (c >> 3), (c & 0x7), G0_LATIN_NATIONAL_SUBSETS[m].language);
             primary_charset.current = c;
         }
     }
@@ -207,7 +201,7 @@ static void ucs2_to_utf8(char *r, uint16_t ch) {
 // check parity and translate any reasonable teletext character into ucs2
 static uint16_t telx_to_ucs2(uint8_t c) {
     if (PARITY_8[c] == 0) {
-        VERBOSE_ONLY fprintf(stderr, "! Unrecoverable data error; PARITY(%02x)\n", c);
+        log_warn("Unrecoverable data error; PARITY(%02x)", c);
         return 0x20;
     }
 
@@ -347,11 +341,6 @@ static void process_telx_packet(data_unit_t data_unit_id, teletext_packet_payloa
         uint8_t flag_subtitle = (unham_8_4(packet->data[5]) & 0x08) >> 3;
         cc_map[i] |= flag_subtitle << (m - 1);
 
-        if ((config.page == 0) && (flag_subtitle == YES) && (i < 0xff)) {
-            config.page = (m << 8) | (unham_8_4(packet->data[1]) << 4) | unham_8_4(packet->data[0]);
-            fprintf(stderr, "- No teletext page specified, first received suitable page is %03x, not guaranteed\n", config.page);
-        }
-
         // Page number and control bits
         uint16_t page_number = (m << 8) | (unham_8_4(packet->data[1]) << 4) | unham_8_4(packet->data[0]);
         uint8_t charset = ((unham_8_4(packet->data[7]) & 0x08) | (unham_8_4(packet->data[7]) & 0x04) | (unham_8_4(packet->data[7]) & 0x02)) >> 1;
@@ -428,7 +417,7 @@ static void process_telx_packet(data_unit_t data_unit_id, teletext_packet_payloa
         for (uint8_t j = 0; j < 13; j++) {
             if (triplets[j] == 0xffffffff) {
                 // invalid data (HAM24/18 uncorrectable error detected), skip group
-                VERBOSE_ONLY fprintf(stderr, "! Unrecoverable data error; UNHAM24/18()=%04x\n", triplets[j]);
+                log_warn("Unrecoverable data error; UNHAM24/18()=%04x", triplets[j]);
                 continue;
             }
 
@@ -477,7 +466,7 @@ static void process_telx_packet(data_unit_t data_unit_id, teletext_packet_payloa
 
             if (triplet0 == 0xffffffff) {
                 // invalid data (HAM24/18 uncorrectable error detected), skip group
-                VERBOSE_ONLY fprintf(stderr, "! Unrecoverable data error; UNHAM24/18()=%04x\n", triplet0);
+                log_warn("Unrecoverable data error; UNHAM24/18()=%04x", triplet0);
             }
             else {
                 // ETS 300 706, chapter 9.4.2: Packet X/28/0 Format 1 only
@@ -499,7 +488,7 @@ static void process_telx_packet(data_unit_t data_unit_id, teletext_packet_payloa
 
             if (triplet0 == 0xffffffff) {
                 // invalid data (HAM24/18 uncorrectable error detected), skip group
-                VERBOSE_ONLY fprintf(stderr, "! Unrecoverable data error; UNHAM24/18()=%04x\n", triplet0);
+                log_warn("Unrecoverable data error; UNHAM24/18()=%04x", triplet0);
             }
             else {
                 // ETS 300 706, table 11: Coding of Packet M/29/0
@@ -519,7 +508,7 @@ static void process_telx_packet(data_unit_t data_unit_id, teletext_packet_payloa
         if (states.programme_info_processed == NO) {
             // ETS 300 706, chapter 9.8.1: Packet 8/30 Format 1
             if (unham_8_4(packet->data[0]) < 2) {
-                fprintf(stderr, "- Programme Identification Data = ");
+                fprintf(stderr, "[INFO] Programme Identification Data = ");
                 for (uint8_t i = 20; i < 40; i++) {
                     uint8_t c = telx_to_ucs2(packet->data[i]);
                     // strip any control codes from PID, eg. TVP station
@@ -556,11 +545,11 @@ static void process_telx_packet(data_unit_t data_unit_id, teletext_packet_payloa
                 time_t now = time(NULL);
                 time_t diff = (time_t) lroundf( (t0 - now) / 3600.0 ) * 3600;
                 t0 -= diff;
-                fprintf(stderr, "- Programme Timestamp (UTC) = %s", ctime(&t0));
 
-                VERBOSE_ONLY fprintf(stderr, "- Transmission mode = %s\n", (transmission_mode == TRANSMISSION_MODE_SERIAL ? "serial" : "parallel"));
+                log_info("Programme Timestamp (UTC) = %s", ctime(&t0));
+                log_info("Transmission mode = %s", (transmission_mode == TRANSMISSION_MODE_SERIAL ? "serial" : "parallel"));
+                log_info("Broadcast Service Data Packet received, resetting UTC referential value to %s", ctime(&t0));
 
-                fprintf(stderr, "- Broadcast Service Data Packet received, resetting UTC referential value to %s", ctime(&t0));
                 config.utc_refvalue = (uint32_t) t0;
                 states.pts_initialized = NO;
 
@@ -606,10 +595,10 @@ static void process_pes_packet(uint8_t *buffer, uint16_t size) {
     if (using_pts == UNDEF) {
         if ((optional_pes_header_included == YES) && ((buffer[7] & 0x80) > 0)) {
             using_pts = YES;
-            VERBOSE_ONLY fprintf(stderr, "- PID 0xbd PTS available\n");
+            log_warn("PID 0xbd PTS available");
         } else {
             using_pts = NO;
-            VERBOSE_ONLY fprintf(stderr, "- PID 0xbd PTS unavailable, using TS PCR\n");
+            log_warn("PID 0xbd PTS unavailable, using TS PCR");
         }
     }
 
@@ -672,7 +661,7 @@ static void process_pes_packet(uint8_t *buffer, uint16_t size) {
 
 void process_ts_packet(uint8_t *ts_packet) {
     if (!ts_validate(ts_packet)) {
-        VERBOSE_ONLY fprintf(stderr, "Invalid TS packet received. Skipping\n"); // WARN
+        log_warn("Invalid TS packet received. Skipping");
         return;
     }
 
@@ -697,7 +686,7 @@ void process_ts_packet(uint8_t *ts_packet) {
 
     // uncorrectable error?
     if (header.transport_error > 0) {
-        VERBOSE_ONLY fprintf(stderr, "! Uncorrectable TS packet error (received CC %1x)\n", header.continuity_counter);
+        log_warn("Uncorrectable TS packet error (received CC %1x)", header.continuity_counter);
         return;
     }
 
@@ -731,7 +720,7 @@ void process_ts_packet(uint8_t *ts_packet) {
             if (af_discontinuity == 0) {
                 continuity_counter = (continuity_counter + 1) % 16;
                 if (header.continuity_counter != continuity_counter) {
-                    VERBOSE_ONLY fprintf(stderr, "- Missing TS packet, flushing pes_buffer (expected CC %1x, received CC %1x, TS discontinuity %s, TS priority %s)\n",
+                    log_warn("Missing TS packet, flushing pes_buffer (expected CC %1x, received CC %1x, TS discontinuity %s, TS priority %s)",
                         continuity_counter, header.continuity_counter, (af_discontinuity ? "YES" : "NO"), (header.transport_priority ? "YES" : "NO"));
                     payload_counter = 0;
                     continuity_counter = 255;
@@ -755,14 +744,11 @@ void process_ts_packet(uint8_t *ts_packet) {
         if (payload_counter < (PAYLOAD_BUFFER_SIZE - TS_PACKET_PAYLOAD_SIZE)) {
             memcpy(&payload_buffer[payload_counter], &ts_packet[4], TS_PACKET_PAYLOAD_SIZE);
             payload_counter += TS_PACKET_PAYLOAD_SIZE;
+        } else {
+            log_warn("Packet payload size exceeds payload_buffer size, probably not teletext stream");
         }
-        else VERBOSE_ONLY fprintf(stderr, "! Packet payload size exceeds payload_buffer size, probably not teletext stream\n");
     }
 }
-
-void telxcc_init(uint16_t pid, uint16_t page) {
-}
-
 
 int main(const int argc, char *argv[]) {
     uint16_t pid, page;
@@ -805,8 +791,7 @@ int main(const int argc, char *argv[]) {
 
     e = setsockopt(s, IPPROTO_IP, IP_ADD_MEMBERSHIP, (struct ip_mreq[]){{
             .imr_multiaddr.s_addr = addr,
-            .imr_interface.s_addr = htonl(INADDR_ANY)
-        }}, sizeof(struct ip_mreq));
+            .imr_interface.s_addr = htonl(INADDR_ANY)}}, sizeof(struct ip_mreq));
     if (e == -1)
         err(1, "setsockopt");
 
@@ -816,18 +801,16 @@ int main(const int argc, char *argv[]) {
     // reading input
     while (1) {
         if (recv(s, &buffer, sizeof buffer, 0) != sizeof buffer) {
-            VERBOSE_ONLY fprintf(stderr, "Read to few packets :-(\n"); // WARN
-            continue;
+            log_warn("Read to few packets :-(");
         } else if (!rtp_check_hdr(&buffer[0])) {
-            VERBOSE_ONLY fprintf(stderr, "Invalid RTP packet received. Skipping\n"); // WARN
-            continue;
-        }
+            log_warn("Invalid RTP packet received. Skipping");
+        } else {
+            ts_packet = rtp_payload(&buffer[0]);
 
-        ts_packet = rtp_payload(&buffer[0]);
-
-        for (int i = 0; i < 7; i++) {
-            process_ts_packet(ts_packet);
-            ts_packet += TS_SIZE;
+            for (int i = 0; i < 7; i++) {
+                process_ts_packet(ts_packet);
+                ts_packet += TS_SIZE;
+            }
         }
     }
 
