@@ -419,7 +419,6 @@ void process_page(teletext_page_t *page) {
 	page_is_empty:
 	if (page_is_empty == YES) return;
 
-	if (page->show_timestamp > page->hide_timestamp) page->hide_timestamp = page->show_timestamp;
 
 	if (config.se_mode == YES) {
 		++frames_produced;
@@ -430,9 +429,11 @@ void process_page(teletext_page_t *page) {
 		timestamp_to_srttime(page->show_timestamp, timecode_show);
 		timecode_show[12] = 0;
 
-		char timecode_hide[24] = { 0 };
-		timestamp_to_srttime(page->hide_timestamp, timecode_hide);
-		timecode_hide[12] = 0;
+		char timecode_hide[24] = { '?', 0 };
+		if (page->hide_timestamp > 0) {
+			timestamp_to_srttime(page->hide_timestamp, timecode_hide);
+			timecode_hide[12] = 0;
+		}
 
 		fprintf(fout, "%"PRIu32"\r\n%s --> %s\r\n", ++frames_produced, timecode_show, timecode_hide);
 	}
@@ -589,10 +590,11 @@ void process_telx_packet(data_unit_t data_unit_id, teletext_packet_payload_t *pa
 		// Page transmission is terminated, however now we are waiting for our new page
 		if (page_number != config.page) return;
 
+		fprintf(fout, "NOTE timestamp %"PRIu64"\n\n", timestamp);
+
 		// Now we have the begining of page transmission; if there is page_buffer pending, process it
 		if (page_buffer.tainted == YES) {
-			// it would be nice, if subtitle hides on previous video frame, so we contract 40 ms (1 frame @25 fps)
-			page_buffer.hide_timestamp = timestamp - 40;
+			page_buffer.hide_timestamp = timestamp;
 			process_page(&page_buffer);
 		}
 
@@ -1360,7 +1362,7 @@ int main(const int argc, char *argv[]) {
 	// output any pending close caption
 	if (page_buffer.tainted == YES) {
 		// this time we do not subtract any frames, there will be no more frames
-		page_buffer.hide_timestamp = last_timestamp;
+		page_buffer.hide_timestamp = 0;
 		process_page(&page_buffer);
 	}
 
@@ -1414,3 +1416,4 @@ fail:
 
 	return ret;
 }
+
